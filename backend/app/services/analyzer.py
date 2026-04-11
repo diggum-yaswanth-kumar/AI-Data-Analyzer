@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from difflib import get_close_matches
 from typing import Any
 
 import numpy as np
@@ -238,6 +240,143 @@ def detect_anomalies(dataframe: pd.DataFrame) -> list[str]:
     return findings[:6]
 
 
+def _normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _match_column(question: str, columns: list[str], preferred: list[str] | None = None) -> str | None:
+    normalized_question = _normalize_text(question)
+    ordered_columns = preferred or columns
+
+    for column in ordered_columns:
+        normalized_column = _normalize_text(column)
+        if normalized_column and normalized_column in normalized_question:
+            return column
+
+    question_tokens = set(normalized_question.split())
+    token_scored: list[tuple[int, str]] = []
+    for column in ordered_columns:
+        column_tokens = set(_normalize_text(column).split())
+        overlap = len(question_tokens & column_tokens)
+        if overlap:
+            token_scored.append((overlap, column))
+    if token_scored:
+        token_scored.sort(reverse=True)
+        return token_scored[0][1]
+
+    normalized_map = {_normalize_text(column): column for column in ordered_columns}
+    matches = get_close_matches(normalized_question, list(normalized_map.keys()), n=1, cutoff=0.55)
+    if matches:
+        return normalized_map[matches[0]]
+    return None
+
+
+def _pick_category_and_metric(
+    dataframe: pd.DataFrame,
+    question: str,
+    numeric_columns: list[str],
+    categorical_columns: list[str],
+) -> tuple[str | None, str | None]:
+    metric = _match_column(question, numeric_columns, preferred=numeric_columns)
+    category = _match_column(question, categorical_columns, preferred=categorical_columns)
+
+    if not category:
+        category = _pick_category_column(dataframe, categorical_columns)
+    if not metric and numeric_columns:
+        metric = numeric_columns[0]
+    return category, metric
+
+
+def _top_group_answer(
+    dataframe: pd.DataFrame,
+    category: str,
+    metric: str,
+    top_n: int = 5,
+) -> tuple[str, str]:
+    grouped = (
+        dataframe.dropna(subset=[category])
+        .groupby(category, dropna=False)[metric]
+        .sum()
+        .sort_values(ascending=False)
+    )
+    top_items = grouped.head(top_n)
+    leader_name = _clean_value(top_items.index[0])
+    leader_value = _clean_value(top_items.iloc[0])
+    formatted_top = ", ".join(
+        f"{_clean_value(index)} ({round(float(value), 2)})"
+        for index, value in top_items.items()
+    )
+    answer = (
+        f"{leader_name} contributes the most to {metric} with a total of "
+        f"{round(float(leader_value), 2)}. Top contributors are: {formatted_top}."
+    )
+    reasoning = f"This groups the dataset by `{category}` and sums `{metric}` for each category."
+    return answer, reasoning
+
+
+def _missing_data_answer(dataframe: pd.DataFrame) -> tuple[str, str]:
+    missing = dataframe.isna().sum()
+    non_zero = missing[missing > 0].sort_values(ascending=False)
+    if non_zero.empty:
+        return (
+            "The dataset does not show any missing values, so no immediate cleanup issue stands out.",
+            "This is based on a column-by-column null value scan.",
+        )
+
+    top_items = ", ".join(f"{column} ({int(count)} missing)" for column, count in non_zero.head(5).items())
+    answer = (
+        f"The columns that most likely need cleanup are {top_items}. "
+        "These fields should be reviewed before reporting or modeling."
+    )
+    reasoning = "This is based on the number of missing values in each column."
+    return answer, reasoning
+
+
+def _distribution_answer(dataframe: pd.DataFrame, question: str, categorical_columns: list[str]) -> tuple[str, str] | None:
+    category = _match_column(question, categorical_columns, preferred=categorical_columns)
+    if not category:
+        category = _pick_category_column(dataframe, categorical_columns)
+    if not category:
+        return None
+
+    counts = dataframe[category].astype("string").value_counts(dropna=False).head(5)
+    formatted = ", ".join(f"{_clean_value(index)} ({int(value)})" for index, value in counts.items())
+    answer = f"The distribution of {category} is led by: {formatted}."
+    reasoning = f"This counts the frequency of values in `{category}`."
+    return answer, reasoning
+
+
+def _trend_answer(dataframe: pd.DataFrame, question: str, numeric_columns: list[str]) -> tuple[str, str] | None:
+    date_columns = infer_datetime_columns(dataframe)
+    if not date_columns or not numeric_columns:
+        return None
+
+    date_column = _match_column(question, date_columns, preferred=date_columns) or date_columns[0]
+    metric = _match_column(question, numeric_columns, preferred=numeric_columns) or numeric_columns[0]
+
+    temp = dataframe.copy()
+    temp[date_column] = pd.to_datetime(temp[date_column], errors="coerce", format="mixed")
+    temp = (
+        temp.dropna(subset=[date_column])
+        .groupby(date_column, as_index=False)[metric]
+        .sum()
+        .sort_values(date_column)
+    )
+    if len(temp) < 2:
+        return None
+
+    start_value = float(temp.iloc[0][metric])
+    end_value = float(temp.iloc[-1][metric])
+    delta = end_value - start_value
+    direction = "increased" if delta > 0 else "decreased" if delta < 0 else "stayed flat"
+    answer = (
+        f"{metric} {direction} over time, moving from {round(start_value, 2)} to "
+        f"{round(end_value, 2)} across the available {date_column} periods."
+    )
+    reasoning = f"This aggregates `{metric}` by `{date_column}` and compares the earliest and latest periods."
+    return answer, reasoning
+
+
 def build_fallback_ai_insights(profile: dict[str, Any], quick_insights: dict[str, Any]) -> dict[str, Any]:
     summary_parts = [
         f"This dataset contains {profile['row_count']} rows across {profile['column_count']} columns.",
@@ -314,27 +453,58 @@ def analyze_dataset(dataframe: pd.DataFrame, file_name: str) -> dict[str, Any]:
 def chat_with_dataset(dataframe: pd.DataFrame, question: str) -> dict[str, Any]:
     lower_question = question.lower()
     numeric_columns = dataframe.select_dtypes(include=["number"]).columns.tolist()
+    categorical_columns = dataframe.select_dtypes(exclude=["number", "datetime"]).columns.tolist()
 
     answer = ""
     reasoning = ""
     if "rows" in lower_question or "records" in lower_question:
         answer = f"The dataset contains {len(dataframe)} rows."
         reasoning = "This was calculated directly from the uploaded dataframe length."
+    elif any(keyword in lower_question for keyword in ["clean", "cleanup", "missing", "null", "blank"]):
+        answer, reasoning = _missing_data_answer(dataframe)
     elif "columns" in lower_question:
         answer = f"The dataset contains {len(dataframe.columns)} columns: {', '.join(dataframe.columns)}."
         reasoning = "This is based on the dataframe schema."
+    elif ("sum" in lower_question or "total" in lower_question) and numeric_columns:
+        target = _match_column(question, numeric_columns, preferred=numeric_columns) or numeric_columns[0]
+        answer = f"The total of {target} is {round(float(dataframe[target].sum()), 2)}."
+        reasoning = f"The response sums all values in the numeric column `{target}`."
     elif ("average" in lower_question or "mean" in lower_question) and numeric_columns:
-        target = next((col for col in numeric_columns if col.lower() in lower_question), numeric_columns[0])
+        target = _match_column(question, numeric_columns, preferred=numeric_columns) or numeric_columns[0]
         answer = f"The average of {target} is {round(float(dataframe[target].mean()), 2)}."
         reasoning = f"The response uses the numeric column `{target}` and computes its mean."
     elif ("highest" in lower_question or "max" in lower_question) and numeric_columns:
-        target = next((col for col in numeric_columns if col.lower() in lower_question), numeric_columns[0])
+        target = _match_column(question, numeric_columns, preferred=numeric_columns) or numeric_columns[0]
         answer = f"The maximum value in {target} is {round(float(dataframe[target].max()), 2)}."
         reasoning = f"The response uses the numeric column `{target}` and computes its maximum."
     elif ("lowest" in lower_question or "min" in lower_question) and numeric_columns:
-        target = next((col for col in numeric_columns if col.lower() in lower_question), numeric_columns[0])
+        target = _match_column(question, numeric_columns, preferred=numeric_columns) or numeric_columns[0]
         answer = f"The minimum value in {target} is {round(float(dataframe[target].min()), 2)}."
         reasoning = f"The response uses the numeric column `{target}` and computes its minimum."
+    elif any(keyword in lower_question for keyword in ["contributes", "contribute", "top category", "top segment", "which segment", "which category", "most value", "highest contribution"]):
+        category, metric = _pick_category_and_metric(dataframe, question, numeric_columns, categorical_columns)
+        if category and metric:
+            answer, reasoning = _top_group_answer(dataframe, category, metric)
+    elif any(keyword in lower_question for keyword in ["distribution", "breakdown", "categories", "category share"]):
+        result = _distribution_answer(dataframe, question, categorical_columns)
+        if result:
+            answer, reasoning = result
+    elif any(keyword in lower_question for keyword in ["anomaly", "anomalies", "outlier", "unusual", "spike", "drop"]):
+        findings = detect_anomalies(dataframe)
+        if findings:
+            answer = "Here are the main anomaly signals I found: " + " ".join(findings[:3])
+            reasoning = "This uses a local anomaly scan based on z-score outliers and missing-value hotspots."
+        else:
+            result = _trend_answer(dataframe, question, numeric_columns)
+            if result:
+                answer, reasoning = result
+            else:
+                answer = "I did not detect a major anomaly from the quick local scan."
+                reasoning = "The local anomaly scan did not find strong outlier or missing-value warnings."
+    elif any(keyword in lower_question for keyword in ["trend", "over time", "increase", "decrease", "growth"]):
+        result = _trend_answer(dataframe, question, numeric_columns)
+        if result:
+            answer, reasoning = result
 
     if answer:
         return {
@@ -348,9 +518,18 @@ def chat_with_dataset(dataframe: pd.DataFrame, question: str) -> dict[str, Any]:
 
     context = {
         "question": question,
+        "profile": build_profile(dataframe, "uploaded-dataset"),
         "columns": dataframe.columns.tolist(),
         "row_count": int(len(dataframe)),
         "numeric_summary": dataframe[numeric_columns].describe().fillna(0).round(2).to_dict() if numeric_columns else {},
+        "categorical_preview": {
+            column: [
+                {"label": _clean_value(index), "count": int(value)}
+                for index, value in dataframe[column].astype("string").value_counts(dropna=False).head(5).items()
+            ]
+            for column in categorical_columns[:5]
+        },
+        "quick_anomalies": detect_anomalies(dataframe),
         "sample_rows": build_preview(dataframe, limit=8),
     }
 

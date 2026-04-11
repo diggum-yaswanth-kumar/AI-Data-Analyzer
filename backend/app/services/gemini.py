@@ -92,6 +92,9 @@ Dataset profile:
     def answer_question(self, payload: dict[str, Any]) -> dict[str, Any]:
         prompt = f"""
 You are answering a user's natural language question about a dataset.
+Answer from the provided dataset context only.
+If the answer is not fully knowable from the context, say that clearly and give the closest grounded answer you can.
+Prefer direct, business-friendly responses over vague advice.
 Return strict JSON with:
 {{
   "answer": "clear answer",
