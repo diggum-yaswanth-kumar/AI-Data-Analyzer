@@ -377,6 +377,51 @@ def _trend_answer(dataframe: pd.DataFrame, question: str, numeric_columns: list[
     return answer, reasoning
 
 
+def _chat_fallback_answer(dataframe: pd.DataFrame, question: str) -> dict[str, Any]:
+    profile = build_profile(dataframe, "uploaded-dataset")
+    numeric_columns = profile["numeric_columns"]
+    categorical_columns = profile["categorical_columns"]
+    anomalies = detect_anomalies(dataframe)
+
+    summary_parts = [
+        f"I could not map that exact question directly, but I can still summarize the dataset.",
+        f"It has {profile['row_count']} rows and {profile['column_count']} columns.",
+    ]
+    if numeric_columns:
+        lead_metric = numeric_columns[0]
+        summary_parts.append(
+            f"The primary numeric field appears to be `{lead_metric}`, with an average of {round(float(dataframe[lead_metric].mean()), 2)} and a maximum of {round(float(dataframe[lead_metric].max()), 2)}."
+        )
+    if categorical_columns:
+        lead_category = _pick_category_column(dataframe, categorical_columns) or categorical_columns[0]
+        top_values = (
+            dataframe[lead_category]
+            .astype("string")
+            .value_counts(dropna=False)
+            .head(3)
+        )
+        if not top_values.empty:
+            top_summary = ", ".join(
+                f"{_clean_value(index)} ({int(value)})" for index, value in top_values.items()
+            )
+            summary_parts.append(f"The leading values in `{lead_category}` are {top_summary}.")
+    if anomalies:
+        summary_parts.append(f"Main quality or anomaly signals: {' '.join(anomalies[:2])}")
+
+    return {
+        "answer": " ".join(summary_parts),
+        "reasoning": (
+            "This fallback is generated from the uploaded dataframe profile, descriptive statistics, "
+            "top category counts, and anomaly scan when a more specific answer is unavailable."
+        ),
+        "follow_up": [
+            "Which category contributes the most?",
+            "Which columns need cleanup before reporting?",
+            "What trends or anomalies stand out?",
+        ],
+    }
+
+
 def build_fallback_ai_insights(profile: dict[str, Any], quick_insights: dict[str, Any]) -> dict[str, Any]:
     summary_parts = [
         f"This dataset contains {profile['row_count']} rows across {profile['column_count']} columns.",
@@ -536,12 +581,5 @@ def chat_with_dataset(dataframe: pd.DataFrame, question: str) -> dict[str, Any]:
     try:
         return gemini_service.answer_question(context)
     except Exception:
-        return {
-            "answer": "I could not fully interpret that question automatically. Try asking about totals, averages, min/max values, row counts, or category distributions.",
-            "reasoning": "The local query helper handles common dataset questions, while Gemini handles broader business and exploratory questions.",
-            "follow_up": [
-                "What are the top 5 categories?",
-                "What are the main anomalies in the dataset?",
-            ],
-        }
+        return _chat_fallback_answer(dataframe, question)
 
