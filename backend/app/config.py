@@ -24,6 +24,14 @@ class Settings(BaseModel):
     def report_dir(self) -> Path:
         return self.storage_dir / "reports"
 
+    @property
+    def frontend_origins(self) -> list[str]:
+        return [
+            origin.strip()
+            for origin in self.frontend_origin.split(",")
+            if origin.strip()
+        ]
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -32,10 +40,12 @@ def get_settings() -> Settings:
     settings = Settings(
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
-        frontend_origin=os.getenv("FRONTEND_ORIGIN", "http://localhost:3000"),
+        frontend_origin=os.getenv(
+            "FRONTEND_ORIGIN",
+            "http://localhost:3000,http://127.0.0.1:3000",
+        ),
         max_sample_rows=int(os.getenv("MAX_SAMPLE_ROWS", "20")),
     )
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     settings.report_dir.mkdir(parents=True, exist_ok=True)
     return settings
-
